@@ -2,6 +2,9 @@
 #include <stddef.h>
 #include <stdbool.h>
 
+extern uint64_t _kernel_start;
+extern uint64_t _kernel_end;
+
 static const uint8_t letters[256][8] = {
 {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00},  // 0000 (uni0000.dup1)
     {0x7e, 0x81, 0xa5, 0x81, 0xbd, 0x99, 0x81, 0x7e},  // 0001 (uni0001)
@@ -389,7 +392,7 @@ static uint64_t buf_pos = 0;
 void init_paging(void)
 {
 	uint64_t i;
-	uint64_t end = (uint64_t)&_pages_end;
+	uint64_t end = (uint64_t)&_kernel_end;
 	uint64_t begin = (uint64_t)&_pages_start;
 	uint64_t count = (end - begin) / PAGE_SIZE;
 
@@ -459,7 +462,7 @@ static void put_pixel(uint64_t x, uint64_t y, uint32_t color)
 	screen[where + 2] = (color >> 16) & 0xFF;
 }
 
-#define TEXT_COLOR 0x20C20E
+#define TEXT_COLOR 0xFFFFFF
 
 static void draw_letter(const uint8_t *letter, uint64_t x, uint64_t y)
 {
@@ -556,31 +559,84 @@ struct __attribute__((packed)) memory_entry_info {
 	uint32_t reserved;
 };
 
-struct area_info {
-	uint64_t addr;
-	uint64_t allocatable_pages_count;
-};
-static int init_phy_alloc(uint64_t addr, struct area_info **ainfo, uint64_t len)
+#define _packed __attribute__((packed))
+
+static uint64_t phy_memory_map[80000];
+
+static inline uint64_t floor_page(uint64_t x)
 {
-	uint64_t a_addr = (addr + PAGE_SIZE - 1) & ~(0xFFF);
-	uint64_t housekeeping_len, pages_count;
-
-	len -= (a_addr - addr);
-	pages_count = len / PAGE_SIZE;
-
-	// We need (at least) one page for housekeeping information
-	if (pages_count <= 1)
-		return -1;
-
-	housekeeping_len = sizeof(struct area_info) + (pages_count / 8);
-	*ainfo = (struct area_info *)a_addr;
-	(*ainfo)->addr = a_addr;
-	(*ainfo)->allocatable_pages_count = pages_count;
+	return x & ~(0xFFF);
 }
+
+static inline uint64_t ceil_page(uint64_t x)
+{
+	return floor_page(x + PAGE_SIZE - 1);
+}
+
+static inline void bitmap_set(uint64_t *b, size_t x)
+{
+	b[x / sizeof(*b) / 8] |= 1 << (x % (sizeof(*b) * 8));
+}
+
+static inline bool bitmap_test(uint64_t *b, size_t x)
+{
+	return b[x / sizeof(*b) / 8] & (1 << (x % (sizeof(*b) * 8)));
+}
+
+static inline void bitmap_clear(uint64_t *b, size_t x)
+{
+	b[x / sizeof(*b) / 8] &= ~(1ULL << (x % (sizeof(*b) * 8)));
+}
+
+enum PAGE_TYPE {
+	PAGE_FREE,
+	PAGE_TAKEN,
+};
+
+static void mark_pages(uint64_t start, uint64_t end, enum PAGE_TYPE ptype)
+{
+	for (size_t i = floor_page(start); i <= end; i += PAGE_SIZE)
+		if (ptype == PAGE_FREE)
+			bitmap_clear(phy_memory_map, i / PAGE_SIZE);
+		else
+			bitmap_set(phy_memory_map, i / PAGE_SIZE);
+}
+
+static void init_phy_alloc(void)
+{
+	memset(phy_memory_map, 0xFF, 65536 * sizeof(uint64_t));
+}
+
+static void *alloc_physical_page(void)
+{
+	int x = -1;
+	for (size_t i = 0; i < sizeof(phy_memory_map) / sizeof(phy_memory_map[0]); i++) {
+		if (phy_memory_map[i] != 0xFFFFFFFFFFFFFFFFULL) {
+			x = i;
+			break;
+		}
+	}
+	if (x == -1)
+		return NULL;
+
+	for (size_t i = 0; i < 8 * 8; i++) {
+		if (!bitmap_test(phy_memory_map, x * 64 + i)) {
+			bitmap_set(phy_memory_map, x * 64 + i);
+			return (x * 64 + i) * PAGE_SIZE;
+		}
+	}
+
+	return NULL;
+}
+
+static struct memory_entry_info *mem_info;
+static struct memory_entry_header *mem_hdr;
+static struct area_info *main_mem;
 
 static void parse_info_struct(void)
 {
 	struct info_header *header = (struct info_header *)info_struct;
+	struct memory_entry_info *temp;
 
 	if (header->reserved != 0)
 		EARLY_PANIC("AHTUNG! Header struct is not clean\n");
@@ -588,8 +644,6 @@ static void parse_info_struct(void)
 	uint64_t data = (uint64_t)info_struct + 8;
 
 	char *bootloader_name = NULL;
-	struct memory_entry_info *mem_info;
-	struct memory_entry_header *mem_hdr;
 	while ((uint64_t)data < (uint64_t)info_struct + header->total_size) {
 		uint32_t cur_type = *((uint32_t *)data);
 		uint32_t cur_size = *((uint32_t *)(data + 4));
@@ -613,22 +667,238 @@ static void parse_info_struct(void)
 	map_range(fb->framebuffer_addr, fb->framebuffer_addr, pages_count);
 
 	print_s(logo);
-	print_s("Super OS by Ivan Orlov\n");
-	if (bootloader_name)
+	if (bootloader_name) {
 		print_s(bootloader_name);
+		print_c('\n');
+	}
 
-	mem_info += (mem_hdr->tag.size - 16) / mem_hdr->entry_size - 1;
-
-	pr_n_s("Base addr: ", mem_info->base_addr);
-	pr_n_s("Length: ", mem_info->length);
+	temp = &mem_info[(mem_hdr->tag.size - 16) / mem_hdr->entry_size - 1];
+	while (temp > mem_info) {
+		put_n("Type:", temp->type);
+		put_n("Base:", temp->base_addr);
+		put_n("Len:", temp->length);
+		if (temp->type == 1)
+			mark_pages(temp->base_addr, temp->base_addr + temp->length, PAGE_FREE);	
+		temp--;
+	}
+	mark_pages(&_kernel_start, &_kernel_end, PAGE_TAKEN);
 }
+
+static void alloc_virt_range(uint64_t va, uint64_t pc)
+{
+	size_t i;
+	uint64_t pa;
+
+	for (i = 0; i < pc; i++) {
+		pa = alloc_physical_page();
+		map_addr(va + i * PAGE_SIZE, pa);
+	}
+}
+
+/* HEAP */
+#define HEAP_PAGES 64
+#define BIN_COUNT 12
+static uint64_t bins[BIN_COUNT + 1] = {};
+struct _packed block_hdr {
+	uint64_t prev_size;
+	// Last bit: taken / free
+	// Size of the block excluding header
+	uint64_t size;
+	struct block_hdr *next_in_bin;
+};
+
+typedef struct block_hdr block_t;
+static void *heap;
+
+#define HEAP_ADDR 0x1337FFFF000ULL
+#define HEAP_END (HEAP_ADDR + PAGE_SIZE * HEAP_PAGES)
+
+static void init_heap(void)
+{
+	alloc_virt_range(HEAP_ADDR, HEAP_PAGES);
+	heap = (void *) HEAP_ADDR;
+	// bins[BINS_COUNT] = initial, large region
+	bins[BIN_COUNT] = heap;
+	struct block_hdr *main_block = (struct block_hdr *)heap;
+	main_block->prev_size = 0;
+	main_block->size = HEAP_PAGES * PAGE_SIZE - sizeof(block_t);
+	main_block->next_in_bin = 0;
+}
+
+static inline uint64_t find_bin(uint64_t block_size)
+{
+	uint64_t pow = 0;
+
+	while (pow < BIN_COUNT && (1ULL << (3 + pow)) < block_size)
+		pow++;
+
+	return pow;
+}
+
+static inline uint64_t ceil8(uint64_t x)
+{
+	return (x + 7) / 8 * 8;
+}
+
+static void put_block2bin(block_t *b)
+{
+	size_t bin = find_bin(b->size);
+	block_t *tmp;
+	block_t *f = (block_t *)bins[bin];
+
+	if (bins[bin] == 0 || f->size > b->size) {
+		tmp = (block_t *)bins[bin];
+		bins[bin] = b;
+		b->next_in_bin = tmp;
+		return;
+	}
+	while (f->next_in_bin && f->size < b->size)
+		f = f->next_in_bin;
+
+	tmp = f->next_in_bin;
+	f->next_in_bin = b;
+	b->next_in_bin = tmp;
+}
+
+static void remove_from_bin(block_t *b)
+{
+	block_t *prev = NULL;
+	size_t bin = find_bin(b->size);
+	if (bins[bin] == (uint64_t)b) {
+		bins[bin] = b->next_in_bin;
+		return;
+	}
+	block_t *c = (block_t *)bins[bin];
+	pr_n_s("Removing ", b->size);
+	pr_n_s("From bin ", bin);
+	while (c) {
+		if (c == b) {
+			prev->next_in_bin = c->next_in_bin;
+			return;
+		}
+		prev = c;
+		c = c->next_in_bin;
+	}
+	EARLY_PANIC("There is no bin!");
+}
+
+#define bs sizeof(block_t)
+static void *kmalloc(uint64_t size)
+{
+	size_t bin;
+
+	size = ceil8(size);
+	pr_n_s("allocating ", size);
+	bin = find_bin(size);
+	while (bin <= BIN_COUNT && bins[bin] == 0)
+		bin++;
+	if (bin > BIN_COUNT)
+		return NULL;
+
+	// Take block out of the bin
+	block_t *block = (block_t *)bins[bin];
+	bins[bin] = block->next_in_bin;
+	uint64_t diff = block->size - size;
+	if (diff > sizeof(block_t)) {
+		block_t *sec = (block_t *)((uint64_t)block + sizeof(block_t) + size);
+		sec->size = diff - sizeof(block_t);
+		sec->prev_size = size;
+		block->size = size;
+		pr_n_s("Sec size: ", sec->size);
+		//put block back
+		put_block2bin(sec);
+	}
+	block->size |= 1ULL;
+	pr_n_s("Final bs:", block->size);
+	return (void *)((uint64_t)block + sizeof(block_t));
+}
+
+static block_t *merge_back(block_t *b)
+{
+	while (b) {
+		if (b->prev_size == 0)
+			return b;
+		block_t *prev = (block_t *)((uint64_t)b - b->prev_size - sizeof(block_t));
+		if (prev->size & 1ULL) {
+			/* Prev is taken */
+			break;
+		}
+		remove_from_bin(prev);
+		prev->size += sizeof(block_t) + b->size;
+		b = prev;
+	}
+	return b;
+}
+static void merge_forward(block_t *b)
+{
+	block_t *cur = b;
+	while ((uint64_t)(cur + bs + cur->size) < HEAP_END) {
+		block_t *next = (block_t *) ((uint64_t)cur + bs + cur->size);
+		pr_n_s("Next block is:", next->size);
+		if (next->size & 1) {
+			next->prev_size = b->size;
+			break;
+		}
+		print_serial("Removing next");
+		remove_from_bin(next);
+		b->size += next->size + bs;
+		cur = next;
+	}
+}
+
+static void *kfree(void *addr, bool b)
+{
+	block_t *block = (block_t *)(addr - bs);
+	block->size ^= 1ULL;
+	pr_n_s("Before merge back size: ", block->size);
+	block = merge_back(block);
+	pr_n_s("After merge back size: ", block->size);
+	merge_forward(block);
+	put_block2bin(block);
+}
+
+static void print_bins(void)
+{
+	print_serial("Bins content:\n");
+	for (size_t i = 0; i < BIN_COUNT + 1; i++) {
+		print_num_serial(bins[i]);
+		print_c_serial(' ');
+	}
+	print_c_serial('\n');
+}
+
 int kernel_main(void)
 {
 	init_serial();
 	init_paging();
 	map_addr((void *)0xDEADCAFE000ULL, (void *)boot_info);
 	info_struct = (void *)(0xDEADCAFE000ULL + (boot_info & 0xFFFULL));
+	init_phy_alloc();
 	parse_info_struct();
-	asm("hlt");
+
+	uint64_t *t = alloc_physical_page();
+	map_addr(t, t);
+	put_n("Page: ", t);
+	t[0] = 0x123;
+	put_n("Val: ", t[0]);
+	print_s("Initializing heap...");
+	init_heap();
+	block_t *lb = (block_t *)bins[BIN_COUNT];
+	print_s("Done!\n");
+	print_s("Allocating test block (size: 0x26)...");
+	pr_n_s("Last bin size:", lb->size);
+	void *bl = kmalloc(0x20);
+	void *bl2 = kmalloc(0x8);
+	put_n("Done! Addr: ", bl);
+	put_n("Done! Addr2: ", bl2);
+	print_bins();
+	kfree(bl, false);
+	print_bins();
+	kfree(bl2, true);
+	print_bins();
+	pr_n_s("Last bin size:", lb->size);
+
+
+	while(1);
 	return 0;
 }
